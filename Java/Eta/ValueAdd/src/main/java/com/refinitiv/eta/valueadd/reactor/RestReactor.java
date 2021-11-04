@@ -195,7 +195,7 @@ class RestReactor {
         _reactorActive = true;
 
         loggerClient = LoggerFactory.getLogger(this.getClass());
-        bufferPool = new ArrayList<StringBuilder>();
+        bufferPool = new ArrayList<>();
     }
 
     RestReactorOptions restReactorOptions() {
