@@ -11,6 +11,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BiConsumer;
 
 import javax.net.ssl.SSLContext;
 
@@ -104,6 +105,48 @@ class RestReactor {
     private List<StringBuilder> bufferPool = null;
     Lock lock = new ReentrantLock();
 
+    private class Wrapper<T> implements FutureCallback<T> {
+        private final FutureCallback<T> delegate;
+        private final BiConsumer<T, Exception> consumer;
+
+        private Wrapper(FutureCallback<T> cb, BiConsumer<T, Exception> consumer) {
+            this.delegate = cb;
+            this.consumer = consumer;
+        }
+
+        @Override
+        public void cancelled() {
+            safeTraceLog(null, null);
+            delegate.cancelled();
+        }
+
+        @Override
+        public void completed(T result) {
+            safeTraceLog(result, null);
+            delegate.completed(result);
+        }
+
+        @Override
+        public void failed(Exception ex) {
+            safeTraceLog(null, ex);
+            delegate.failed(ex);
+
+        }
+
+        @Override
+        public String toString() {
+            return delegate.toString();
+        }
+
+        private void safeTraceLog(T result, Exception ex) {
+            try {
+                consumer.accept(result, ex);
+            } catch (Exception e) {
+                loggerClient.warn("Trace logging failed: {}", e.getMessage(), e);
+            }
+        }
+    }
+
     public RestReactor(RestReactorOptions options, ReactorErrorInfo errorInfo) {
         if (errorInfo == null) {
             throw new UnsupportedOperationException("ReactorErrorInfo cannot be null");
@@ -184,6 +227,10 @@ class RestReactor {
                     "RestReactor is not active, aborting");
         }
 
+        if (loggerClient.isDebugEnabled()) {
+            loggerClient.debug("Submitting auth request");
+        }
+
         final List<NameValuePair> params = new ArrayList<>(7);
         params.add(new BasicNameValuePair(AUTH_GRANT_TYPE, authOptions.grantType()));
         params.add(new BasicNameValuePair(AUTH_USER_NAME, authOptions.username()));
@@ -223,17 +270,12 @@ class RestReactor {
             url = restConnectOptions.tokenServiceURL();
         }
 
+        final RestHandler restHandler = new RestHandler(this, authOptions, restConnectOptions, authTokenInfo,
+                errorInfo);
+
         if ((restConnectOptions.proxyHost() == null || restConnectOptions.proxyHost().isEmpty())
                 || (restConnectOptions.proxyPort() == -1)) {
             final BasicHttpEntityEnclosingRequest httpRequest = new BasicHttpEntityEnclosingRequest(AUTH_POST, url);
-            final RestHandler candidate = new RestHandler(this, authOptions, restConnectOptions, authTokenInfo,
-                    errorInfo);
-            final FutureCallback<HttpResponse> restHandler = loggerClient.isTraceEnabled()
-                    ? TraceLoggingRestHandlerWrapper.wrap(candidate, (response, ex) ->
-                    // trace logging could be extended with success or fail depending on which
-                    // arguments are set
-                    loggerClient.trace(prepareRequestString(httpRequest, restConnectOptions)))
-                    : candidate;
 
             httpRequest.setEntity(new UrlEncodedFormEntity(params, Consts.UTF_8));
             if (authOptions.hasHeaderAttribute()) {
@@ -246,11 +288,11 @@ class RestReactor {
                     .add(new RequestUserAgent(AUTH_REQUEST_USER_AGENT)).add(new RequestExpectContinue(true)).build());
 
             requester.execute(new BasicAsyncRequestProducer(restConnectOptions.tokenServiceHost(), httpRequest),
-                    new BasicAsyncResponseConsumer(), _pool, HttpClientContext.create(), restHandler);
+                    new BasicAsyncResponseConsumer(), _pool, HttpClientContext.create(),
+                    wrapIfNecessary(restHandler, (response, exception) -> loggerClient
+                            .trace(prepareRequestString(httpRequest, restConnectOptions))));
 
         } else {
-            final RestHandler restHandler = new RestHandler(this, authOptions, restConnectOptions, authTokenInfo,
-                    errorInfo);
             final RestProxyAuthHandler proxyAuthHandler = new RestProxyAuthHandler(this, _sslconSocketFactory);
 
             new Thread() {
@@ -343,28 +385,21 @@ class RestReactor {
 
         httpRequest.setHeader(HttpHeaders.AUTHORIZATION, AUTH_BEARER + token);
 
+        final RestHandler restHandler = new RestHandler(this, request, restConnectOptions, authTokenInfo,
+                reactorServiceEndpointInfoList, errorInfo);
+
         if ((restConnectOptions.proxyHost() == null || restConnectOptions.proxyHost().isEmpty())
                 || (restConnectOptions.proxyPort() == -1)) {
-
-            final FutureCallback<HttpResponse> candidate = new RestHandler(this, request, restConnectOptions,
-                    authTokenInfo, reactorServiceEndpointInfoList, errorInfo);
-
-            final FutureCallback<HttpResponse> restHandler = loggerClient.isTraceEnabled()
-                    ? TraceLoggingRestHandlerWrapper.wrap(candidate, (response, ex) ->
-                    // trace logging could be extended with success or fail depending on which
-                    // arguments are set
-                    loggerClient.trace(prepareRequestString(httpRequest, restConnectOptions)))
-                    : candidate;
 
             final HttpAsyncRequester requester = new HttpAsyncRequester(HttpProcessorBuilder.create()
                     .add(new RequestContent()).add(new RequestTargetHost()).add(new RequestConnControl())
                     .add(new RequestUserAgent(AUTH_REQUEST_USER_AGENT)).add(new RequestExpectContinue(true)).build());
             requester.execute(new BasicAsyncRequestProducer(restConnectOptions.serviceDiscoveryHost(), httpRequest),
-                    new BasicAsyncResponseConsumer(), _pool, HttpCoreContext.create(), restHandler);
+                    new BasicAsyncResponseConsumer(), _pool, HttpCoreContext.create(),
+                    wrapIfNecessary(restHandler, (response, exception) -> loggerClient
+                            .trace(prepareRequestString(httpRequest, restConnectOptions))));
 
         } else {
-            final RestHandler restHandler = new RestHandler(this, request, restConnectOptions, authTokenInfo,
-                    reactorServiceEndpointInfoList, errorInfo);
 
             final RestProxyAuthHandler proxyAuthHandler = new RestProxyAuthHandler(this, _sslconSocketFactory);
             new Thread() {
@@ -1003,6 +1038,15 @@ class RestReactor {
         }
 
         return returnString;
+    }
+
+    private <T> FutureCallback<T> wrapIfNecessary(FutureCallback<T> delegate,
+            BiConsumer<T, Exception> traceLoggerCallback) {
+        if (!loggerClient.isTraceEnabled()) {
+            return delegate;
+        }
+
+        return new Wrapper<T>(delegate, traceLoggerCallback);
     }
 
     private StringBuilder extractFromPool() {
